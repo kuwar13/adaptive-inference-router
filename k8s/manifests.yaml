@@ -1,0 +1,79 @@
+# Kubernetes deployment for the router + model pool.
+# Each model is its own Deployment + Service (a TGI pod) with its own HPA, so
+# tiers scale independently. The router is stateless and scales on CPU.
+# This is the telemetry/reliability surface referenced in bullet 2.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router
+  labels: { app: router }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: router } }
+  template:
+    metadata: { labels: { app: router } }
+    spec:
+      containers:
+        - name: router
+          image: registry.example.com/adaptive-router:latest
+          ports: [{ containerPort: 8000 }]
+          env:
+            - { name: MLFLOW_TRACKING_URI, value: "http://mlflow:5000" }
+            - { name: SMALL_ENDPOINT, value: "http://qwen-7b:80" }
+            - { name: MID_ENDPOINT,   value: "http://qwen-32b:80" }
+            - { name: LARGE_ENDPOINT, value: "http://qwen-72b:80" }
+            - { name: CODE_ENDPOINT,  value: "http://qwen-coder-7b:80" }
+          readinessProbe: { httpGet: { path: /healthz, port: 8000 }, initialDelaySeconds: 5 }
+          livenessProbe:  { httpGet: { path: /healthz, port: 8000 }, initialDelaySeconds: 10 }
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: router-hpa }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: router }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+---
+# One model tier shown; duplicate this block for qwen-32b, qwen-72b, qwen-coder-7b.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: qwen-7b, labels: { app: qwen-7b, tier: small } }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: qwen-7b } }
+  template:
+    metadata: { labels: { app: qwen-7b } }
+    spec:
+      containers:
+        - name: tgi
+          image: ghcr.io/huggingface/text-generation-inference:latest
+          args: ["--model-id", "Qwen/Qwen2.5-7B-Instruct"]
+          ports: [{ containerPort: 80 }]
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          readinessProbe: { httpGet: { path: /health, port: 80 }, initialDelaySeconds: 60 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: qwen-7b }
+spec:
+  selector: { app: qwen-7b }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: qwen-7b-hpa }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: qwen-7b }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: gpu, target: { type: Utilization, averageUtilization: 70 } }
