@@ -25,14 +25,11 @@ class ModelSpec:
     max_context: int     # token limit of the model
 
 
-# The pool. One model family (Qwen2.5) so quality scales predictably across
-# tiers, plus a code-specialized model so "specialized" is literally true.
-POOL = {
-    "small": ModelSpec("Qwen2.5-7B-Instruct",       "small", cost_per_request=1.0, base_latency=0.25, max_context=32000),
-    "code":  ModelSpec("Qwen2.5-Coder-7B-Instruct", "code",  cost_per_request=1.0, base_latency=0.28, max_context=32000),
-    "mid":   ModelSpec("Qwen2.5-32B-Instruct",      "mid",   cost_per_request=3.5, base_latency=0.55, max_context=32000),
-    "large": ModelSpec("Qwen2.5-72B-Instruct",      "large", cost_per_request=8.0, base_latency=1.10, max_context=32000),
-}
+    POOL = {
+        "small": ModelSpec("gpt-5.6-luna", "small", cost_per_request=1.0,  base_latency=0.20, max_context=1_000_000),
+        "mid":   ModelSpec("gpt-5.6-terra", "mid",  cost_per_request=10.0, base_latency=0.45, max_context=1_000_000),
+        "large": ModelSpec("gpt-5.6-sol",   "large", cost_per_request=25.0, base_latency=1.10, max_context=1_000_000),
+    }
 
 
 class ModelBackend:
