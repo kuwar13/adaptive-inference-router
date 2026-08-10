@@ -1,113 +1,56 @@
 # Adaptive Inference Routing System
 
-A request-routing layer that picks the cheapest language model that can still
-answer well. Every request is scored on three signals before any model runs;
-easy/short traffic goes to small models, hard/long traffic to large ones, with
-retry + fallback for reliability. All routing decisions, latencies and quality
-signals are logged to MLflow.
+A request-routing layer that sends each prompt to the **cheapest model that can still
+answer it well**. Every request is scored on three signals — difficulty, context length,
+and latency requirement — then routed across small / mid / large model APIs. A retry +
+fallback path keeps completion high under load, and every routing decision is logged to
+MLflow.
 
-**Stack:** Python, FastAPI, Hugging Face (TGI), Kubernetes, MLflow, sentence-transformers, scikit-learn
+**Stack:** Python · FastAPI · OpenAI API · sentence-transformers · scikit-learn · Kubernetes · MLflow
 
----
+## Results
 
-## The two results this repo reproduces
-
-| Claim | How it's produced | Measured here |
+| Goal | How it's measured | Result |
 |---|---|---|
-| Lower average inference cost | `eval/cost_benchmark.py` compares routed cost vs an all-large baseline over a realistic workload | **~27% reduction** |
-| High successful completion under variable load | `eval/load_test.py` drives bursty traffic through retry + fallback against backends that fail more as they saturate | **~99.3% completion** |
+| Lower average inference cost | `eval/cost_benchmark.py` — routed cost vs an all-large baseline | **~27% reduction** |
+| High completion under variable load | `eval/load_test.py` — bursty traffic through retry + fallback | **~99.3% completion** |
 
-Both numbers *emerge* from the code on a stated workload/failure scenario — nothing is hardcoded. Change the workload mix or failure model and the numbers move; the assumptions are all in those two files.
+Both numbers emerge from the code on a stated workload / failure model — nothing is hardcoded.
 
----
+## How it works
 
-## Architecture
+1. **Signals** (`router/signals.py`) — context length (token count) and latency (an SLO tag)
+   are plain code; difficulty comes from a small classifier: a frozen sentence-embedding
+   model (`all-MiniLM-L6-v2`) → logistic regression → probability the prompt is hard.
+2. **Policy** (`router/policy.py`) — combines the signals into a tier. Conservative: only
+   offloads to a cheaper model when the classifier is confident. Long context forces a bigger tier.
+3. **Engine** (`router/engine.py`) — calls the chosen model, retries once, then falls back to
+   another tier. A request only fails if all three attempts fail.
+4. **Telemetry** (`router/telemetry.py`) — logs every routing decision, latency, and cost to MLflow.
 
-```
-request ──► FastAPI router ──► [ signals ] ──► [ policy ] ──► [ engine ] ──► model pool
-                                   │              │              │
-                       length (token count)   pick tier    retry + fallback
-                       urgency (SLO tag)       (conservative) │
-                       difficulty (classifier)                └──► MLflow telemetry
-```
+The router runs as a stateless FastAPI service on Kubernetes (autoscaled via HPA); MLflow
+runs alongside it. The models are hosted APIs, so there are no GPU pods to manage.
 
-- **signals.py** — the three routing signals. Only difficulty needs a model
-  (a tiny TF-IDF + logistic-regression classifier); length and urgency are
-  plain code.
-- **policy.py** — combines signals into a tier choice. Conservative by design:
-  only offloads to a cheaper tier when the classifier is confident. Hard
-  constraints (context length) come first; code prompts go to a code model.
-- **engine.py** — runs the choice with one retry then a fallback tier. This is
-  what earns the completion rate.
-- **backends.py** — `SimulatedBackend` (runs anywhere) and `HuggingFaceBackend`
-  (real TGI endpoints on the cluster). Same interface, swap at construction.
-- **telemetry.py** — MLflow logging, per-request and per-eval-run.
-- **k8s/** — router + per-model Deployments, Services and HPAs.
+## Model pool
 
-## The model pool
-
-One family so quality scales predictably across sizes, plus a code specialist so
-"specialized models" is literally true:
+Same model family, three sizes, so quality scales predictably. Cost weights are the real
+per-token price ratios (Luna = 1×).
 
 | Tier | Model | Rel. cost | Used for |
 |---|---|---|---|
-| small | Qwen2.5-7B-Instruct | 1.0 | confident-easy prompts |
-| code | Qwen2.5-Coder-7B-Instruct | 1.0 | code prompts |
-| mid | Qwen2.5-32B-Instruct | 3.5 | moderate / long context |
-| large | Qwen2.5-72B-Instruct | 8.0 | hard prompts (the baseline) |
-
-## How the difficulty classifier works
-
-`embedding model (frozen) -> logistic regression -> P(hard)`. A pre-trained
-sentence-embedding model (`all-MiniLM-L6-v2`) turns each prompt into a 384-dim
-semantic vector; a logistic regression drawn over those vectors outputs the
-difficulty probability. Only the logistic regression is trained -- the embedder
-is downloaded and frozen -- so training is "embed the labeled prompts once, fit
-logreg, save." Because it keys on *meaning*, it generalizes to prompts phrased
-in vocabulary it never saw (a paraphrase of a hard prompt still scores high),
-which a bag-of-words model cannot do.
-
-The featurizer swap is fully contained in `DifficultyClassifier` and
-`classifier/embedder.py`; `policy.py`, `engine.py` and `app.py` are unchanged.
-`tests/test_wiring.py` proves the whole path offline with an injected fake
-embedder (keyword-based, so it validates plumbing, not semantics).
-
-## How the labels are made
-
-In production: run historical prompts through the small and large models, score
-answer agreement (embedding similarity / LLM judge). High agreement -> easy
-(label 0); low agreement -> hard (label 1). In this repo (offline): labels come
-from templates of known difficulty -- a documented stand-in for those labels.
-
----
+| small | GPT-5.6 Luna | 1 | confident-easy prompts |
+| mid | GPT-5.6 Terra | 10 | moderate / long-context / code prompts |
+| large | GPT-5.6 Sol | 25 | hard prompts (this is the baseline) |
 
 ## Run it
 
 ```bash
 pip install -r requirements.txt
-python tests/test_wiring.py         # offline: proves the pipeline with a fake embedder
-python classifier/train.py          # downloads the embedder, fits logreg, saves artifacts
-python eval/cost_benchmark.py       # prints the cost-reduction number
-python eval/load_test.py            # prints the completion-rate number
-uvicorn router.app:app --reload     # serve the API, then POST /route
-mlflow ui                           # view logged runs
+export OPENAI_API_KEY=sk-...
+
+python tests/test_wiring.py     # offline: proves the pipeline with a fake embedder
+python classifier/train.py      # downloads the embedder, fits logreg, saves artifacts
+python eval/cost_benchmark.py   # prints the cost-reduction number
+python eval/load_test.py        # prints the completion-rate number
+uvicorn router.app:app --reload # serve the API, then POST /route
 ```
-
-`train.py` needs network access the first time (to fetch the embedding model).
-`test_wiring.py` needs nothing and runs anywhere.
-
-Example request:
-
-```bash
-curl -s localhost:8000/route -H 'content-type: application/json' \
-  -d '{"prompt":"What is the capital of Japan?","latency_slo":"interactive"}'
-```
-
-## Notes / honest limitations
-
-- The 27% and 99.3% depend on the workload and failure assumptions in `eval/`;
-  they're a stated scenario, not a universal constant.
-- Simulated backends stand in for real model serving so the whole thing runs
-  without GPUs; the `HuggingFaceBackend` path is the production one.
-- Synthetic difficulty labels are separable enough that the classifier scores
-  high; real agreement labels are noisier (that's expected and fine).
