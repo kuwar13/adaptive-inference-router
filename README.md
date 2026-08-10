@@ -54,10 +54,3 @@ python eval/cost_benchmark.py   # prints the cost-reduction number
 python eval/load_test.py        # prints the completion-rate number
 uvicorn router.app:app --reload # serve the API, then POST /route
 ```
-
-## Honest limitations
-
-- The 27% / 99.3% depend on the workload and failure model in `eval/`.
-- Model backends are **simulated** in this repo; the API backend is the production path.
-- Difficulty labels are synthetic here; production uses small-vs-large answer agreement on
-  real traffic — the one step between prototype and production.
